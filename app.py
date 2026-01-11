@@ -136,7 +136,7 @@ if st.button("🔍 Fetch Latest Orders"):
 
     for idx, row in df.iterrows():
 
-        case_type_input = str(row["Case Type"]).trim()
+        case_type_input = str(row["Case Type"]).strip()
         case_no = str(row["Case No"]).strip()
         case_year = str(row["Case Year"]).strip()
         cnr = str(row["CNR"]).strip()
@@ -201,3 +201,4 @@ if st.button("🔍 Fetch Latest Orders"):
     st.session_state.table = df
     st.success("Fetching Completed!")
     st.dataframe(df, use_container_width=True)
+
