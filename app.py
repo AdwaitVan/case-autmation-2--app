@@ -47,13 +47,13 @@ def resolve_case_type_name(short_code):
     return mapping.get(code, short_code)
 
 # ==============================================================================
-# 3. CORE LOGIC: PLAYWRIGHT ROBOT (WITH CLOUD FIX)
+# 3. CORE LOGIC: PLAYWRIGHT ROBOT (DEBUG MODE)
 # ==============================================================================
 def fetch_cnr_data(side, case_type_text, case_no, case_year):
     url = "https://bombayhighcourt.nic.in/case_query.php"
     
     with sync_playwright() as p:
-        # --- CRITICAL FIX FOR CLOUD CRASHES ---
+        # Launch Browser (Cloud Safe)
         browser = p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
@@ -77,15 +77,31 @@ def fetch_cnr_data(side, case_type_text, case_no, case_year):
             else:
                 side_select.select_option(label="Civil")
                 
-            # Wait for reload
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1500) # Wait for dropdown to reload
 
-            # 3. Select Case Type
+            # 3. Select Case Type (WITH DEBUG LOGGING)
             ctype_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[6]/div[2]/select"
+            
             try:
+                # Attempt to select
                 page.locator(ctype_xpath).select_option(label=case_type_text)
             except:
-                return {"status": "Error", "message": f"Could not find Case Type '{case_type_text}' in dropdown."}
+                # --- DEBUG LOG START ---
+                # If selection fails, grab ALL options from the website to see what is wrong
+                all_options = page.locator(f"{ctype_xpath}/option").all_inner_texts()
+                
+                # Clean up list (remove empty blanks)
+                clean_options = [opt.strip() for opt in all_options if opt.strip()]
+                
+                # Create a readable error message
+                debug_msg = (
+                    f"❌ **ERROR: Could not find '{case_type_text}'**\n\n"
+                    f"🔍 **Here are the ACTUAL options on the website right now:**\n"
+                    f"--------------------------------------------------\n"
+                    f"{', '.join(clean_options[:20])} ... (and more)"
+                )
+                return {"status": "Error", "message": debug_msg}
+                # --- DEBUG LOG END ---
 
             # 4. Enter Case Number
             cno_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[8]/div[2]/input"
@@ -95,17 +111,16 @@ def fetch_cnr_data(side, case_type_text, case_no, case_year):
             cyear_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[9]/div[2]/select"
             page.locator(cyear_xpath).select_option(label=str(case_year))
 
-            # 6. Solve Captcha (The URL Trick)
+            # 6. Solve Captcha (URL Trick)
             captcha_img = page.locator("//img[contains(@src,'captcha')]")
             src_url = captcha_img.get_attribute("src")
             
-            code = "12345" # Fallback
+            code = "12345" 
             if src_url:
                 match = re.search(r"[?&]rand=([A-Za-z0-9]+)", src_url)
                 if match:
                     code = match.group(1)
             
-            # Input the code
             captcha_input_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[13]/div[2]/input[2]"
             page.locator(captcha_input_xpath).fill(code)
 
@@ -113,11 +128,9 @@ def fetch_cnr_data(side, case_type_text, case_no, case_year):
             go_btn = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[14]/input"
             page.locator(go_btn).click()
             
-            # 8. Wait for results
             page.wait_for_timeout(2000)
 
             # 9. Extract CNR
-            # Look for the result cell
             result_cell = page.locator("/html/body/div[3]/div/div[2]/form/table/tbody/tr[3]/td[2]")
             
             if result_cell.is_visible():
@@ -133,7 +146,6 @@ def fetch_cnr_data(side, case_type_text, case_no, case_year):
             return {"status": "Error", "message": str(e)}
         finally:
             browser.close()
-
 # ==============================================================================
 # 4. STREAMLIT UI
 # ==============================================================================
@@ -176,3 +188,4 @@ if st.button("🔍 Get CNR Number", type="primary"):
             st.caption("You can now use this CNR to fetch orders.")
         else:
             st.error(f"❌ {result['message']}")
+
