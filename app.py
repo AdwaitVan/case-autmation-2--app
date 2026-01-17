@@ -1,204 +1,180 @@
 import streamlit as st
-import pandas as pd
-import requests
-from datetime import datetime
-from case_type_map import resolve_case_type
+import subprocess
+import re
+import time
+from playwright.sync_api import sync_playwright
 
-# =============================================================================
-# COURT MAP
-# =============================================================================
-
-COURT_MAP = {
-    "Bombay (Principal Seat)": {"state": 24, "dist": 0, "court": 1},
-    "Nagpur Bench": {"state": 24, "dist": 0, "court": 2},
-    "Aurangabad Bench": {"state": 24, "dist": 0, "court": 3},
-    "Goa Bench": {"state": 24, "dist": 0, "court": 4},
-}
-
-# =============================================================================
-# API HELPERS
-# =============================================================================
-
-def fetch_by_cnr(cnr: str):
-    """Fetch case details using CNR number."""
-    url = "https://hcservices.ecourts.gov.in/ecourtindiaHC/services/caseDetailsByCnr.php"
-    resp = requests.get(url, params={"cnr_number": cnr}, timeout=15)
-
-    if not resp.ok:
-        return None
-
-    data = resp.json()
-
-    if not data or "case_details" not in data:
-        return None
-
-    details = data["case_details"][0]
-
-    return {
-        "case_type": details.get("case_type", ""),
-        "case_no": details.get("case_number", ""),
-        "year": details.get("case_year", ""),
-        "state": details.get("state_code", ""),
-        "dist": details.get("dist_code", ""),
-        "court": details.get("court_code", ""),
-    }
-
-
-def fetch_latest_order(state, dist, court, case_type, case_no, year):
-    """Fetch latest order for a case."""
-    url = "https://hcservices.ecourts.gov.in/ecourtindiaHC/services/getOrderDetails.php"
-
-    params = {
-        "state_code": state,
-        "dist_code": dist,
-        "court_code": court,
-        "case_type": case_type,
-        "case_no": case_no,
-        "case_year": year,
-    }
-
-    resp = requests.get(url, params=params, timeout=15)
-
-    if not resp.ok:
-        return None
-
-    data = resp.json()
-
-    if not data or "order_details" not in data:
-        return None
-
-    orders = data["order_details"]
-    if not orders:
-        return None
-
-    # Convert date and pick latest
-    for o in orders:
+# ==============================================================================
+# 1. CLOUD SETUP: AUTOMATIC BROWSER INSTALLER
+# ==============================================================================
+def install_playwright():
+    """
+    This runs only once to install the Chromium browser on the Streamlit Cloud server.
+    """
+    if "playwright_installed" not in st.session_state:
         try:
-            o["parsed_date"] = datetime.strptime(o["order_date"], "%Y-%m-%d")
-        except:
-            o["parsed_date"] = datetime.min
+            with st.spinner("🔧 Installing Browser for Cloud (First Run Only)..."):
+                subprocess.run(["playwright", "install", "chromium"], check=True)
+            st.session_state["playwright_installed"] = True
+        except Exception as e:
+            st.error(f"Browser installation failed: {e}")
 
-    latest = sorted(orders, key=lambda x: x["parsed_date"], reverse=True)[0]
-
-    return {
-        "date": latest.get("order_date", ""),
-        "judge": latest.get("order_judge", ""),
-        "link": latest.get("order_link", "")
+# ==============================================================================
+# 2. HELPER: CASE TYPE MAPPER (Simplified)
+# ==============================================================================
+def resolve_case_type_name(short_code):
+    """
+    Maps short codes (WP, SA) to the exact text expected by the High Court dropdown.
+    """
+    code = short_code.strip().upper().replace(".", "")
+    
+    # Common mappings (You can add more from your original file if needed)
+    mapping = {
+        "WP": "Civil Writ Petition",
+        "PIL": "Public Interest Litigation",
+        "SA": "Second Appeal",
+        "FA": "First Appeal",
+        "CA": "Civil Application",
+        "MCA": "Misc.Civil Application",
+        "CRA": "Civil Revision Application",
+        "CP": "Contempt Petition",
+        "LPA": "Letter Patent Appeal",
+        "BA": "Bail Application",
+        "ABA": "Anticipatory Bail Application",
+        "APEAL": "Criminal Appeal",
+        "APPLN": "Criminal Application",
+        "CRWP": "Criminal Writ Petition"
     }
+    
+    # Return the mapped name if found, otherwise return the input as-is
+    return mapping.get(code, short_code)
 
-
-# =============================================================================
-# STREAMLIT UI
-# =============================================================================
-
-st.set_page_config(page_title="Latest High Court Order Fetcher", layout="wide")
-st.title("📄 High Court – Latest Order Fetcher")
-
-# ---------------------------- Court selection ----------------------------
-selected_court = st.selectbox(
-    "Select High Court Bench",
-    list(COURT_MAP.keys()),
-    index=0
-)
-
-court_info = COURT_MAP[selected_court]
-
-# ---------------------------- Table Init ----------------------------
-if "table" not in st.session_state:
-    st.session_state.table = pd.DataFrame({
-        "Case Type": [""],
-        "Case No": [""],
-        "Case Year": [""],
-        "CNR": [""],
-        "Status": [""],
-        "Latest Order Date": [""],
-        "Judge": [""],
-        "PDF Link": [""],
-    })
-
-st.subheader("Enter Case Details Below:")
-
-edited_df = st.data_editor(
-    st.session_state.table,
-    num_rows="dynamic",
-    use_container_width=True
-)
-
-# Save edits
-st.session_state.table = edited_df
-
-# =============================================================================
-# FETCH BUTTON
-# =============================================================================
-
-if st.button("🔍 Fetch Latest Orders"):
-    df = st.session_state.table.copy()
-
-    for idx, row in df.iterrows():
-
-        case_type_input = str(row["Case Type"]).strip()
-        case_no = str(row["Case No"]).strip()
-        case_year = str(row["Case Year"]).strip()
-        cnr = str(row["CNR"]).strip()
-
-        latest_order = None
-
+# ==============================================================================
+# 3. CORE LOGIC: PLAYWRIGHT ROBOT
+# ==============================================================================
+def fetch_cnr_data(side, case_type_text, case_no, case_year):
+    url = "https://bombayhighcourt.nic.in/case_query.php"
+    
+    with sync_playwright() as p:
+        # Launch Headless Chrome
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        )
+        page = context.new_page()
+        
         try:
-            # ============================================================
-            # CASE 1 → USE CNR DIRECTLY
-            # ============================================================
-            if cnr:
-                base = fetch_by_cnr(cnr)
-
-                if not base:
-                    df.at[idx, "Status"] = "❌ Invalid CNR"
-                    continue
-
-                latest_order = fetch_latest_order(
-                    base["state"], base["dist"], base["court"],
-                    base["case_type"], base["case_no"], base["year"]
-                )
-
-            # ============================================================
-            # CASE 2 → CASE TYPE + NUMBER + YEAR
-            # ============================================================
+            # 1. Load Page
+            page.goto(url, timeout=30000)
+            
+            # 2. Select Side (Civil/Criminal/Original)
+            side_select = page.locator("select[name='m_sideflg']")
+            if side.startswith("Crim"):
+                side_select.select_option(label="Criminal")
+            elif side.startswith("Orig"):
+                side_select.select_option(label="Original")
             else:
-                if not (case_type_input and case_no and case_year):
-                    df.at[idx, "Status"] = "❌ Missing Case Info"
-                    continue
+                side_select.select_option(label="Civil")
+                
+            # Wait for reload
+            page.wait_for_timeout(1000)
 
-                # Resolve dropdown version (your mapping)
-                try:
-                    resolved_type = resolve_case_type(case_type_input)
-                except:
-                    df.at[idx, "Status"] = "❌ Invalid Case Type"
-                    continue
+            # 3. Select Case Type
+            # XPath for Case Type Dropdown
+            ctype_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[6]/div[2]/select"
+            # Try to select by label
+            try:
+                page.locator(ctype_xpath).select_option(label=case_type_text)
+            except:
+                return {"status": "Error", "message": f"Could not find Case Type '{case_type_text}' in dropdown."}
 
-                latest_order = fetch_latest_order(
-                    court_info["state"],
-                    court_info["dist"],
-                    court_info["court"],
-                    resolved_type,
-                    case_no,
-                    case_year
-                )
+            # 4. Enter Case Number
+            cno_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[8]/div[2]/input"
+            page.locator(cno_xpath).fill(str(case_no))
 
-            # ============================================================
-            # UPDATE ROW WITH RESULTS
-            # ============================================================
-            if latest_order:
-                df.at[idx, "Status"] = "✅ Found"
-                df.at[idx, "Latest Order Date"] = latest_order["date"]
-                df.at[idx, "Judge"] = latest_order["judge"]
-                df.at[idx, "PDF Link"] = latest_order["link"]
+            # 5. Select Year
+            cyear_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[9]/div[2]/select"
+            page.locator(cyear_xpath).select_option(label=str(case_year))
+
+            # 6. Solve Captcha (The URL Trick)
+            captcha_img = page.locator("//img[contains(@src,'captcha')]")
+            src_url = captcha_img.get_attribute("src")
+            
+            code = "12345" # Fallback
+            if src_url:
+                match = re.search(r"[?&]rand=([A-Za-z0-9]+)", src_url)
+                if match:
+                    code = match.group(1)
+            
+            # Input the code
+            captcha_input_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[13]/div[2]/input[2]"
+            page.locator(captcha_input_xpath).fill(code)
+
+            # 7. Click Go
+            go_btn = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[14]/input"
+            page.locator(go_btn).click()
+            
+            # 8. Wait for results
+            page.wait_for_timeout(2000)
+
+            # 9. Extract CNR
+            # This is the cell where CNR usually appears
+            result_cell = page.locator("/html/body/div[3]/div/div[2]/form/table/tbody/tr[3]/td[2]")
+            
+            if result_cell.is_visible():
+                cnr_text = result_cell.inner_text().strip()
+                return {"status": "Success", "cnr": cnr_text}
             else:
-                df.at[idx, "Status"] = "⚠️ No Orders Found"
+                # Check for "Invalid Captcha" error text
+                body_text = page.inner_text("body")
+                if "Invalid Code" in body_text:
+                    return {"status": "Failed", "message": "Captcha Failed (Try again)"}
+                return {"status": "Failed", "message": "Case not found or inputs incorrect."}
 
         except Exception as e:
-            df.at[idx, "Status"] = f"❌ Error: {e}"
+            return {"status": "Error", "message": str(e)}
+        finally:
+            browser.close()
 
-    # Save & show results
-    st.session_state.table = df
-    st.success("Fetching Completed!")
-    st.dataframe(df, use_container_width=True)
+# ==============================================================================
+# 4. STREAMLIT UI
+# ==============================================================================
 
+st.set_page_config(page_title="High Court Fetcher", page_icon="⚖️")
+
+# Run the installer once
+install_playwright()
+
+st.title("⚖️ Bombay HC - Case Fetcher")
+st.markdown("Automated lookup using **Playwright** on the Cloud.")
+
+# --- Inputs ---
+col1, col2 = st.columns(2)
+with col1:
+    side_input = st.selectbox("Side", ["Civil", "Criminal", "Original"])
+    type_code = st.text_input("Case Type (e.g. WP, SA, BA)", value="WP")
+with col2:
+    num_input = st.text_input("Case Number", value="")
+    year_input = st.selectbox("Year", range(2026, 1990, -1), index=1)
+
+# --- Action ---
+if st.button("🔍 Get CNR Number", type="primary"):
+    if not num_input:
+        st.warning("Please enter a Case Number!")
+    else:
+        # 1. Resolve Name
+        full_type_name = resolve_case_type_name(type_code)
+        
+        st.info(f"🤖 Searching for: **{side_input}** / **{full_type_name}** / **{num_input}/{year_input}**")
+        
+        # 2. Run Robot
+        with st.spinner("Connecting to High Court website..."):
+            result = fetch_cnr_data(side_input, full_type_name, num_input, year_input)
+        
+        # 3. Display
+        if result["status"] == "Success":
+            st.success("✅ Case Found!")
+            st.metric("CNR Number", result["cnr"])
+            st.caption("You can now use this CNR to fetch orders via API.")
+        else:
+            st.error(f"❌ {result['message']}")
