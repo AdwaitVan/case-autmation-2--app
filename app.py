@@ -20,7 +20,7 @@ def install_playwright():
             st.error(f"Browser installation failed: {e}")
 
 # ==============================================================================
-# 2. HELPER: CASE TYPE MAPPER (Simplified)
+# 2. HELPER: CASE TYPE MAPPER
 # ==============================================================================
 def resolve_case_type_name(short_code):
     """
@@ -28,7 +28,6 @@ def resolve_case_type_name(short_code):
     """
     code = short_code.strip().upper().replace(".", "")
     
-    # Common mappings (You can add more from your original file if needed)
     mapping = {
         "WP": "Civil Writ Petition",
         "PIL": "Public Interest Litigation",
@@ -45,19 +44,21 @@ def resolve_case_type_name(short_code):
         "APPLN": "Criminal Application",
         "CRWP": "Criminal Writ Petition"
     }
-    
-    # Return the mapped name if found, otherwise return the input as-is
     return mapping.get(code, short_code)
 
 # ==============================================================================
-# 3. CORE LOGIC: PLAYWRIGHT ROBOT
+# 3. CORE LOGIC: PLAYWRIGHT ROBOT (WITH CLOUD FIX)
 # ==============================================================================
 def fetch_cnr_data(side, case_type_text, case_no, case_year):
     url = "https://bombayhighcourt.nic.in/case_query.php"
     
     with sync_playwright() as p:
-        # Launch Headless Chrome
-        browser = p.chromium.launch(headless=True)
+        # --- CRITICAL FIX FOR CLOUD CRASHES ---
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         )
@@ -80,9 +81,7 @@ def fetch_cnr_data(side, case_type_text, case_no, case_year):
             page.wait_for_timeout(1000)
 
             # 3. Select Case Type
-            # XPath for Case Type Dropdown
             ctype_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[6]/div[2]/select"
-            # Try to select by label
             try:
                 page.locator(ctype_xpath).select_option(label=case_type_text)
             except:
@@ -118,14 +117,13 @@ def fetch_cnr_data(side, case_type_text, case_no, case_year):
             page.wait_for_timeout(2000)
 
             # 9. Extract CNR
-            # This is the cell where CNR usually appears
+            # Look for the result cell
             result_cell = page.locator("/html/body/div[3]/div/div[2]/form/table/tbody/tr[3]/td[2]")
             
             if result_cell.is_visible():
                 cnr_text = result_cell.inner_text().strip()
                 return {"status": "Success", "cnr": cnr_text}
             else:
-                # Check for "Invalid Captcha" error text
                 body_text = page.inner_text("body")
                 if "Invalid Code" in body_text:
                     return {"status": "Failed", "message": "Captcha Failed (Try again)"}
@@ -175,6 +173,6 @@ if st.button("🔍 Get CNR Number", type="primary"):
         if result["status"] == "Success":
             st.success("✅ Case Found!")
             st.metric("CNR Number", result["cnr"])
-            st.caption("You can now use this CNR to fetch orders via API.")
+            st.caption("You can now use this CNR to fetch orders.")
         else:
             st.error(f"❌ {result['message']}")
