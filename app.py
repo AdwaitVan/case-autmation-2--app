@@ -1,3 +1,16 @@
+import os
+import subprocess
+import sys
+
+# --- CRITICAL: AUTO-INSTALL PLAYWRIGHT BROWSER ---
+# This forces Streamlit Cloud to download the browser binary on startup.
+try:
+    print("⬇️ Installing Playwright Chromium...")
+    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+    print("✅ Browser installed!")
+except Exception as e:
+    print(f"❌ Error installing browser: {e}")
+# ------------------------------------------------
 import streamlit as st
 import time
 import base64
@@ -186,3 +199,4 @@ if st.session_state.results:
             # Embed PDF using HTML <iframe>
             pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
             st.markdown(pdf_display, unsafe_allow_html=True)
+
