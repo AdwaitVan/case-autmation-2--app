@@ -1,191 +1,188 @@
 import streamlit as st
-import subprocess
-import re
 import time
+import base64
+from datetime import datetime
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+import PIL.Image
+import ddddocr
 
-# ==============================================================================
-# 1. CLOUD SETUP: AUTOMATIC BROWSER INSTALLER
-# ==============================================================================
-def install_playwright():
-    """
-    This runs only once to install the Chromium browser on the Streamlit Cloud server.
-    """
-    if "playwright_installed" not in st.session_state:
-        try:
-            with st.spinner("🔧 Installing Browser for Cloud (First Run Only)..."):
-                subprocess.run(["playwright", "install", "chromium"], check=True)
-            st.session_state["playwright_installed"] = True
-        except Exception as e:
-            st.error(f"Browser installation failed: {e}")
+# --- PATCH FOR PILLOW/DDDDOCR CONFLICT ---
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 
-# ==============================================================================
-# 2. HELPER: CASE TYPE MAPPER
-# ==============================================================================
-def resolve_case_type_name(short_code):
-    """
-    Maps short codes (WP, SA) to the exact text expected by the High Court dropdown.
-    """
-    code = short_code.strip().upper().replace(".", "")
-    
-    mapping = {
-        "WP": "Civil Writ Petition",
-        "PIL": "Public Interest Litigation",
-        "SA": "Second Appeal",
-        "FA": "First Appeal",
-        "CA": "Civil Application",
-        "MCA": "Misc.Civil Application",
-        "CRA": "Civil Revision Application",
-        "CP": "Contempt Petition",
-        "LPA": "Letter Patent Appeal",
-        "BA": "Bail Application",
-        "ABA": "Anticipatory Bail Application",
-        "APEAL": "Criminal Appeal",
-        "APPLN": "Criminal Application",
-        "CRWP": "Criminal Writ Petition"
-    }
-    return mapping.get(code, short_code)
+# --- CONFIG ---
+URL = "https://hcservices.ecourts.gov.in/hcservices/main.php"
+MAX_RETRIES = 5
 
-# ==============================================================================
-# 3. CORE LOGIC: PLAYWRIGHT ROBOT (DEBUG MODE)
-# ==============================================================================
-def fetch_cnr_data(side, case_type_text, case_no, case_year):
-    url = "https://bombayhighcourt.nic.in/case_query.php"
+CASES_TO_CHECK = [
+    {"name": "Second Appeal", "value": "4", "no": "508", "year": "1999"},
+    {"name": "Writ Petition", "value": "1", "no": "11311", "year": "2025"}
+]
+
+# --- SESSION STATE ---
+if 'results' not in st.session_state:
+    st.session_state.results = [] 
+if 'logs' not in st.session_state:
+    st.session_state.logs = []
+
+# --- HELPER FUNCTIONS ---
+def update_terminal(message, placeholder):
+    now = datetime.now().strftime("%H:%M:%S")
+    st.session_state.logs.append(f"[{now}] {message}")
+    placeholder.code("\n".join(st.session_state.logs), language="bash")
+
+def solve_captcha(page):
+    try:
+        page.wait_for_selector("#captcha_image", state="visible", timeout=3000)
+        time.sleep(1)
+        captcha_img = page.locator("#captcha_image")
+        captcha_bytes = captcha_img.screenshot()
+        ocr = ddddocr.DdddOcr(show_ad=False)
+        code = ocr.classification(captcha_bytes)
+        return code if len(code) == 6 else ""
+    except: return ""
+
+def get_latest_order_link(html_content):
+    soup = BeautifulSoup(html_content, "html.parser")
+    table = soup.find("table", class_="order_table")
+    if not table: return None, None
+    orders = []
+    for row in table.find_all("tr")[1:]:
+        cols = row.find_all("td")
+        if len(cols) < 5: continue
+        date_text = cols[3].get_text(strip=True)
+        link_tag = cols[4].find("a")
+        if date_text and link_tag:
+            try:
+                dt_obj = datetime.strptime(date_text, "%d-%m-%Y")
+                orders.append((dt_obj, link_tag.get("href")))
+            except: continue
+    if not orders: return None, None
+    orders.sort(key=lambda x: x[0], reverse=True)
+    return orders[0][0].strftime("%d-%m-%Y"), orders[0][1]
+
+def run_batch_process(cases, terminal_placeholder):
+    st.session_state.results = []
+    st.session_state.logs = []
     
     with sync_playwright() as p:
-        # Launch Browser (Cloud Safe)
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        )
+        update_terminal("🚀 Starting Robot...", terminal_placeholder)
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         page = context.new_page()
-        
-        try:
-            # 1. Load Page
-            page.goto(url, timeout=30000)
+
+        for case in cases:
+            case_label = f"{case['name']} {case['no']}/{case['year']}"
+            update_terminal(f"\n📂 PROCESSING: {case_label}", terminal_placeholder)
             
-            # 2. Select Side (Civil/Criminal/Original)
-            side_select = page.locator("select[name='m_sideflg']")
-            if side.startswith("Crim"):
-                side_select.select_option(label="Criminal")
-            elif side.startswith("Orig"):
-                side_select.select_option(label="Original")
-            else:
-                side_select.select_option(label="Civil")
-                
-            page.wait_for_timeout(1500) # Wait for dropdown to reload
+            success = False
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    try: page.goto(URL, timeout=60000)
+                    except: continue
 
-            # 3. Select Case Type (WITH DEBUG LOGGING)
-            ctype_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[6]/div[2]/select"
+                    page.locator("#leftPaneMenuCS").click()
+                    try:
+                        page.wait_for_timeout(1000)
+                        if page.locator("button[data-bs-dismiss='modal']").is_visible():
+                            page.locator("button[data-bs-dismiss='modal']").click()
+                    except: pass
+
+                    page.select_option("#sess_state_code", value="1")
+                    page.wait_for_timeout(1000)
+                    page.select_option("#court_complex_code", value="1")
+                    page.wait_for_timeout(1000)
+
+                    if page.locator("#CScaseNumber").is_visible():
+                        page.locator("#CScaseNumber").click()
+
+                    page.select_option("#case_type", value=case['value'])
+                    page.locator("#search_case_no").fill(case['no'])
+                    page.locator("#rgyear").fill(case['year'])
+
+                    code = solve_captcha(page)
+                    if not code:
+                        update_terminal("⚠️ Captcha blurry. Reloading...", terminal_placeholder)
+                        continue
+                    
+                    page.locator("#captcha").fill(code)
+                    page.locator("#goResetDiv input[value='Go']").click()
+                    
+                    try: page.wait_for_selector("#dispTable, text=Invalid Captcha", timeout=15000)
+                    except: continue
+
+                    if page.locator("text=Invalid Captcha").is_visible():
+                        update_terminal("❌ Invalid Captcha. Retrying...", terminal_placeholder)
+                        time.sleep(2)
+                        continue
+                    
+                    page.locator("#dispTable a[onclick*='viewHistory']").first.click()
+                    page.wait_for_selector(".order_table", state="visible", timeout=20000)
+                    
+                    date_str, rel_link = get_latest_order_link(page.content())
+                    
+                    if date_str:
+                        full_url = f"https://hcservices.ecourts.gov.in/hcservices/{rel_link}"
+                        update_terminal(f"📄 Found Order: {date_str}", terminal_placeholder)
+                        
+                        response = page.request.get(full_url)
+                        if response.status == 200:
+                            st.session_state.results.append({
+                                "label": f"{case['no']}/{case['year']}",
+                                "desc": f"{case['name']} (Order: {date_str})",
+                                "data": response.body()
+                            })
+                            update_terminal("✅ Downloaded!", terminal_placeholder)
+                            success = True
+                            break
+                        else:
+                            update_terminal(f"❌ Failed download: {response.status}", terminal_placeholder)
+                    else:
+                        update_terminal("⚠️ No orders found.", terminal_placeholder)
+                        success = True
+                        break
+
+                except Exception as e:
+                    update_terminal(f"❌ Error: {e}", terminal_placeholder)
+                    time.sleep(2)
             
-            try:
-                # Attempt to select
-                page.locator(ctype_xpath).select_option(label=case_type_text)
-            except:
-                # --- DEBUG LOG START ---
-                # If selection fails, grab ALL options from the website to see what is wrong
-                all_options = page.locator(f"{ctype_xpath}/option").all_inner_texts()
-                
-                # Clean up list (remove empty blanks)
-                clean_options = [opt.strip() for opt in all_options if opt.strip()]
-                
-                # Create a readable error message
-                debug_msg = (
-                    f"❌ **ERROR: Could not find '{case_type_text}'**\n\n"
-                    f"🔍 **Here are the ACTUAL options on the website right now:**\n"
-                    f"--------------------------------------------------\n"
-                    f"{', '.join(clean_options[:20])} ... (and more)"
-                )
-                return {"status": "Error", "message": debug_msg}
-                # --- DEBUG LOG END ---
+            if not success: update_terminal(f"❌ Failed all retries for {case_label}", terminal_placeholder)
+            time.sleep(2)
 
-            # 4. Enter Case Number
-            cno_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[8]/div[2]/input"
-            page.locator(cno_xpath).fill(str(case_no))
+        browser.close()
+        update_terminal("\n🏁 Batch Complete!", terminal_placeholder)
 
-            # 5. Select Year
-            cyear_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[9]/div[2]/select"
-            page.locator(cyear_xpath).select_option(label=str(case_year))
+# --- UI LAYOUT ---
+st.set_page_config(page_title="High Court Bot", page_icon="⚖️", layout="wide")
+st.title("⚖️ High Court Viewer")
 
-            # 6. Solve Captcha (URL Trick)
-            captcha_img = page.locator("//img[contains(@src,'captcha')]")
-            src_url = captcha_img.get_attribute("src")
-            
-            code = "12345" 
-            if src_url:
-                match = re.search(r"[?&]rand=([A-Za-z0-9]+)", src_url)
-                if match:
-                    code = match.group(1)
-            
-            captcha_input_xpath = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[13]/div[2]/input[2]"
-            page.locator(captcha_input_xpath).fill(code)
-
-            # 7. Click Go
-            go_btn = "/html/body/div[3]/div/div[2]/form/table/tbody/tr[2]/td/div[14]/input"
-            page.locator(go_btn).click()
-            
-            page.wait_for_timeout(2000)
-
-            # 9. Extract CNR
-            result_cell = page.locator("/html/body/div[3]/div/div[2]/form/table/tbody/tr[3]/td[2]")
-            
-            if result_cell.is_visible():
-                cnr_text = result_cell.inner_text().strip()
-                return {"status": "Success", "cnr": cnr_text}
-            else:
-                body_text = page.inner_text("body")
-                if "Invalid Code" in body_text:
-                    return {"status": "Failed", "message": "Captcha Failed (Try again)"}
-                return {"status": "Failed", "message": "Case not found or inputs incorrect."}
-
-        except Exception as e:
-            return {"status": "Error", "message": str(e)}
-        finally:
-            browser.close()
-# ==============================================================================
-# 4. STREAMLIT UI
-# ==============================================================================
-
-st.set_page_config(page_title="High Court Fetcher", page_icon="⚖️")
-
-# Run the installer once
-install_playwright()
-
-st.title("⚖️ Bombay HC - Case Fetcher")
-st.markdown("Automated lookup using **Playwright** on the Cloud.")
-
-# --- Inputs ---
-col1, col2 = st.columns(2)
+col1, col2 = st.columns([1, 1])
 with col1:
-    side_input = st.selectbox("Side", ["Civil", "Criminal", "Original"])
-    type_code = st.text_input("Case Type (e.g. WP, SA, BA)", value="WP")
+    if st.button("🚀 Fetch & View Orders", type="primary"):
+        run_batch_process(CASES_TO_CHECK, st.empty())
+
 with col2:
-    num_input = st.text_input("Case Number", value="")
-    year_input = st.selectbox("Year", range(2026, 1990, -1), index=1)
+    st.markdown("### 📋 Live Logs")
+    terminal_placeholder = st.empty()
 
-# --- Action ---
-if st.button("🔍 Get CNR Number", type="primary"):
-    if not num_input:
-        st.warning("Please enter a Case Number!")
-    else:
-        # 1. Resolve Name
-        full_type_name = resolve_case_type_name(type_code)
-        
-        st.info(f"🤖 Searching for: **{side_input}** / **{full_type_name}** / **{num_input}/{year_input}**")
-        
-        # 2. Run Robot
-        with st.spinner("Connecting to High Court website..."):
-            result = fetch_cnr_data(side_input, full_type_name, num_input, year_input)
-        
-        # 3. Display
-        if result["status"] == "Success":
-            st.success("✅ Case Found!")
-            st.metric("CNR Number", result["cnr"])
-            st.caption("You can now use this CNR to fetch orders.")
-        else:
-            st.error(f"❌ {result['message']}")
+# --- PDF VIEWER SECTION ---
+if st.session_state.results:
+    st.markdown("---")
+    st.subheader("📑 View Orders")
 
+    # Create Tabs for each result
+    tabs = st.tabs([res['label'] for res in st.session_state.results])
+
+    for i, tab in enumerate(tabs):
+        result = st.session_state.results[i]
+        
+        with tab:
+            st.info(f"**Viewing:** {result['desc']}")
+            
+            # Convert PDF bytes to Base64 for embedding
+            base64_pdf = base64.b64encode(result['data']).decode('utf-8')
+            
+            # Embed PDF using HTML <iframe>
+            pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
+            st.markdown(pdf_display, unsafe_allow_html=True)
