@@ -81,7 +81,17 @@ def run_batch_process(cases, terminal_placeholder):
     
     with sync_playwright() as p:
         update_terminal("🚀 Starting Robot...", terminal_placeholder)
-        browser = p.chromium.launch(headless=True)
+        
+        # --- FIX 1: MEMORY OPTIMIZATION ARGS ---
+        # These flags prevent the browser from crashing on Streamlit Cloud
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-dev-shm-usage',  # Crucial for Cloud
+                '--disable-gpu'
+            ]
+        )
         context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         page = context.new_page()
 
@@ -92,6 +102,10 @@ def run_batch_process(cases, terminal_placeholder):
             success = False
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
+                    # ... (Navigation and Form Filling code remains the same) ...
+                    # COPY YOUR EXISTING NAVIGATION/FORM FILLING LOGIC HERE
+                    # OR USE THE FULL SCRIPT BELOW
+                    
                     try: page.goto(URL, timeout=60000)
                     except: continue
 
@@ -114,6 +128,7 @@ def run_batch_process(cases, terminal_placeholder):
                     page.locator("#search_case_no").fill(case['no'])
                     page.locator("#rgyear").fill(case['year'])
 
+                    # Captcha Logic
                     code = solve_captcha(page)
                     if not code:
                         update_terminal("⚠️ Captcha blurry. Reloading...", terminal_placeholder)
@@ -130,6 +145,7 @@ def run_batch_process(cases, terminal_placeholder):
                         time.sleep(2)
                         continue
                     
+                    # Extract Result
                     page.locator("#dispTable a[onclick*='viewHistory']").first.click()
                     page.wait_for_selector(".order_table", state="visible", timeout=20000)
                     
@@ -137,22 +153,30 @@ def run_batch_process(cases, terminal_placeholder):
                     
                     if date_str:
                         full_url = f"https://hcservices.ecourts.gov.in/hcservices/{rel_link}"
-                        update_terminal(f"📄 Found Order: {date_str}", terminal_placeholder)
+                        update_terminal(f"📄 Found Link: {date_str}", terminal_placeholder)
                         
+                        # --- FIX 2: VALIDATE PDF ---
                         response = page.request.get(full_url)
-                        if response.status == 200:
+                        
+                        # Check if it is actually a PDF
+                        content_type = response.headers.get("content-type", "")
+                        
+                        if response.status == 200 and "application/pdf" in content_type:
                             st.session_state.results.append({
                                 "label": f"{case['no']}/{case['year']}",
                                 "desc": f"{case['name']} (Order: {date_str})",
                                 "data": response.body()
                             })
-                            update_terminal("✅ Downloaded!", terminal_placeholder)
+                            update_terminal("✅ PDF Downloaded Successfully!", terminal_placeholder)
                             success = True
                             break
                         else:
-                            update_terminal(f"❌ Failed download: {response.status}", terminal_placeholder)
+                            # It is an error page
+                            update_terminal("⚠️ Website Error: Order listed but file is missing/not uploaded.", terminal_placeholder)
+                            success = True # Stop retrying, the file just isn't there
+                            break
                     else:
-                        update_terminal("⚠️ No orders found.", terminal_placeholder)
+                        update_terminal("⚠️ No orders found in history.", terminal_placeholder)
                         success = True
                         break
 
@@ -199,4 +223,5 @@ if st.session_state.results:
             # Embed PDF using HTML <iframe>
             pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
             st.markdown(pdf_display, unsafe_allow_html=True)
+
 
